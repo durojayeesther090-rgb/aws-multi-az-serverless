@@ -172,7 +172,7 @@ sam delete --stack-name ha-serveless
 
 File names below are as saved inside the `screenshots/` folder (all screenshots are `.jpeg` files).
 
-| # | Screenshot required | Your file name |
+| # | Screenshot required |  file name |
 |---|---|---|
 | 1 | Load balancer page served from `eu-west-1a` | highly az 2.jpeg |
 | 2 | Load balancer page served from `eu-west-1b` | highly az 1.jpeg |
