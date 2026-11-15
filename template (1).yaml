@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Multi-AZ highly available web tier (ALB + Auto Scaling) and a serverless
+  backend (API Gateway + Lambda + S3 event + DynamoDB).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ha-serverless
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ItemsTable
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-vpc' }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-igw' }]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-a' }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-b' }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.10.0/24
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-private-a' }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.11.0/24
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-private-b' }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  PublicRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  # One NAT gateway per AZ so an AZ failure does not cut off the other AZ.
+  EipA:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties: { Domain: vpc }
+  EipB:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties: { Domain: vpc }
+  NatA:
+    Type: AWS::EC2::NatGateway
+    Properties: { AllocationId: !GetAtt EipA.AllocationId, SubnetId: !Ref PublicSubnetA }
+  NatB:
+    Type: AWS::EC2::NatGateway
+    Properties: { AllocationId: !GetAtt EipB.AllocationId, SubnetId: !Ref PublicSubnetB }
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatA
+  PrivateRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTableA }
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatB
+  PrivateRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTableB }
+
+  # ------------------------------------------- Load balancing + auto scaling
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the internet to the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref InstanceRole] }
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions: { HttpTokens: required }
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            dnf install -y httpd
+            TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            echo "<h1>Highly available web tier</h1><p>Served from $ID in $AZ</p>" > /var/www/html/index.html
+            systemctl enable --now httpd
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '2'
+      MaxSize: '4'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-web', PropagateAtLaunch: true }
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+  # ------------------------------------------------------------- Serverless
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-uploads-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: api_handler.handler
+      Description: HTTP API backend (create/read items in DynamoDB)
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ItemsTable }
+      Events:
+        CreateItem:
+          Type: HttpApi
+          Properties: { Path: /items, Method: POST }
+        ListItems:
+          Type: HttpApi
+          Properties: { Path: /items, Method: GET }
+        GetItem:
+          Type: HttpApi
+          Properties: { Path: '/items/{id}', Method: GET }
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: s3_processor.handler
+      Description: Records S3 uploads as items in DynamoDB
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ItemsTable }
+        - S3ReadPolicy: { BucketName: !Sub '${ProjectName}-uploads-${AWS::AccountId}-${AWS::Region}' }
+      Events:
+        FileUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadBucket
+            Events: s3:ObjectCreated:*
+
+Outputs:
+  AlbUrl:
+    Value: !Sub 'http://${Alb.DNSName}'
+  ApiUrl:
+    Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/items'
+  UploadBucketName:
+    Value: !Ref UploadBucket
+  TableName:
+    Value: !Ref ItemsTable
